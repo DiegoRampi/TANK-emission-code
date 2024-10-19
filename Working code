@@ -1,9 +1,9 @@
-%% Prova 17: Implementazione flux limiter
+%% Prova 18: Implementazione flux limiter con dati Diesel
 clear;
 clc;
 
 
-
+global  M R_gas k D cp_G mu_G cpL h_L rho_liq DeltaH_evap H_c TL A_ant B_ant C_ant NumbersSpatialDiscretisation t_riempimento t_riposo t_svuotamento cycle_duration
 %% inputs 
 
 T_t = 328;  %268,283,288,298,328
@@ -25,7 +25,7 @@ cpL = 2200; % Calore specifico Diesel liquido in J/kg·K
 h_L = 12; % Coefficiente scambio termico del liquido W/m²·K
 rho_liq = 835; % Densità del Diesel liquido a 298 K in kg/m³
 DeltaH_evap = 375000*M; % Calore latente di evaporazione in J/mol
-H_c = 1.5e-06; % Costante di Henry NON UTILIZZATA
+H_c = 0; % Costante di Henry NON UTILIZZATA
 TL = 283; % Temperatura liquido in K
 
 %% Costanti Antoine (per tensione di vapore)
@@ -35,11 +35,8 @@ C_ant =0;
 
 
 %% Parametri discretizzazione
-NumbersSpatialDiscretisation = 140; % Numero di nodi spaziali
-dz = H / (NumbersSpatialDiscretisation); % Passo spaziale
-t_max = 30 * 24 * 3600; % 30 giorni in secondi
-t_vals = linspace(0, t_max, 100); % Divisione temporale
-z = linspace(0, H, NumbersSpatialDiscretisation); % Discretizzazione spaziale
+NumbersSpatialDiscretisation = 70; % Numero di nodi spaziali
+
 
 %% Condizioni iniziali
 T_init = T_t * ones(NumbersSpatialDiscretisation, 1); % Temperatura iniziale uniforme (K)
@@ -91,34 +88,18 @@ t = Output(:,1);
 u_sol = Output(2:end,:);
 
 
-%% FCN with time related jumps
 
+
+%% FCN with time related jumps
 
 function out = OdeCompiler(t_span, ~, ~, ~, ~, ~, diametro, ~, P, ~, ~, ~, ~, ~, ~, ~, ~, ~, H, ~,V_serbatoio, ~, ~, ~, ~, ~,~,T_t,~,~)
 
+global  M R_gas k D cp_G mu_G cpL h_L rho_liq DeltaH_evap H_c TL A_ant B_ant C_ant NumbersSpatialDiscretisation t_riempimento t_riposo t_svuotamento cycle_duration
 
-%% Costanti Diesel
-M = 0.14; % Massa molare del Diesel in kg/mol
-R_gas = 8.314; % Costante dei gas perfetti in J/(mol*K)
-k = 0.025; % Conducibilità termica dell'aria in W/m·K
-D = 10^(-5); % Diffusività in m²/s
-cp_G = 2100; % Calore specifico in J/kg·K
-mu_G = 1.85e-5; % Viscosità dinamica dell'aria (Pa·s)
-cpL = 2200; % Calore specifico Diesel liquido in J/kg·K
-h_L = 12; % Coefficiente scambio termico del liquido W/m²·K
-rho_liq = 835; % Densità del Diesel liquido a 298 K in kg/m³
-DeltaH_evap = 375000*M; % Calore latente di evaporazione in J/mol
-H_c = 1.5e-06; % Costante di Henry
-TL = 283; % Temperatura liquido in K
-
-%% Costanti Antoine (per tensione di vapore)
-A_ant = 12.101;
-B_ant = 8907;
-C_ant =0;
 
 
 %% Parametri discretizzazione
-NumbersSpatialDiscretisation = 70; % Numero di nodi spaziali
+
 y = linspace(0,1,NumbersSpatialDiscretisation);
 
 
@@ -286,8 +267,12 @@ zlabel('T [K]')
 pde_fun(timeSolution_vector(1), Solution_vector(1,:),params{:});
 
 end
+
+
+
+
 %% Funzione PDE con discrezione spaziale
-function Output_array = pde_fun(t, u, NumbersSpatialDiscretisation, D, k_G, cp_G, mu_G, diametro, ~, P, M, R_gas, ~, ~, ~, ~, A_ant, B_ant, C_ant, H, ~,~, t_riempimento, t_riposo, ~, cycle_duration, ~,TL,T_t,v_avg)
+function Output_array = pde_fun(t, u, NumbersSpatialDiscretisation, D, k_G, cp_G, mu_G, diametro, ~, P, M, R_gas, ~, ~, ~, ~, A_ant, B_ant, ~, H, ~,~, t_riempimento, t_riposo, ~, cycle_duration, ~,TL,T_t,v_avg)
 
 
 
@@ -335,6 +320,7 @@ for i = 2:(NumbersSpatialDiscretisation-1)
     limiterC = flux_limiter(rC, 'minmod');  % Usa il limiter scelto
     
     dCdy(i) = limiterC * (Concentration_array(i+1) - Concentration_array(i)) / dy;  % Differenza limitata
+
     
     % Calcolo della derivata della temperatura con il flux limiter
     rT = (Temperature_array(i) - Temperature_array(i-1)) / (Temperature_array(i+1) - Temperature_array(i));
@@ -342,8 +328,7 @@ for i = 2:(NumbersSpatialDiscretisation-1)
     
     dTdy(i) = limiterT * (Temperature_array(i+1) - Temperature_array(i)) / dy;  % Differenza limitata
 
-
-
+   
     % derivate seconde solo con central
     d2Tdy2(i) = (Temperature_array(i+1) - 2 * Temperature_array(i) + Temperature_array(i-1)) / dy^2;
     d2Cdy2(i) = (Concentration_array(i+1) - 2 * Concentration_array(i) + Concentration_array(i-1)) / dy^2;
@@ -578,34 +563,34 @@ for i = 2 : (NumbersSpatialDiscretisation-1)
     dTdt(i) = dTdt_i;
     dCdt(i) = dCdt_i;
 
-    % corrections if something impossibile for a physical POV happens
-
-    % the conditions for dTdt(i) being zeroed are having a point
-    % temperature higher than the roof temperature and it not decreasing
-    % i.e. its time partial derivative is positive
-
-    if (Temperature_array(i)) > Temperature_array(end) && dTdt_i>0
-        %dTdt(i) = (v_avg .* y(i) + (v_star - v_avg)) ./ (v_avg .* t - H) .* dTdy(i) + (alfa(i) ./ (Temperature_array(1) .* (v_avg .* t - H).^2)) * (Temperature_array(i).* d2Tdy2(i) - dTdy(i).^2 + dTdy(1) .* dTdy(i));
-        dTdt(i) = 0;
-
-    else
-        dTdt(i) = dTdt_i;
-
-   end
-
-    % the conditions for dCdt(i) being zeroed are having a point
-    % concentration lower than 0 and it not increasing
-    % i.e. its time partial derivative is negative
-
-    if (Concentration_array(i)) < 0 && dCdt_i<0
-        
-
-        dCdt(i) = 0;
-    else
-        dCdt(i) = dCdt_i;
-
-
-    end
+   %  % corrections if something impossibile for a physical POV happens
+   % 
+   %  % the conditions for dTdt(i) being zeroed are having a point
+   %  % temperature higher than the roof temperature and it not decreasing
+   %  % i.e. its time partial derivative is positive
+   % 
+   %  if (Temperature_array(i)) > Temperature_array(end) && dTdt_i>0
+   %      %dTdt(i) = (v_avg .* y(i) + (v_star - v_avg)) ./ (v_avg .* t - H) .* dTdy(i) + (alfa(i) ./ (Temperature_array(1) .* (v_avg .* t - H).^2)) * (Temperature_array(i).* d2Tdy2(i) - dTdy(i).^2 + dTdy(1) .* dTdy(i));
+   %      dTdt(i) = 0;
+   % 
+   %  else
+   %      dTdt(i) = dTdt_i;
+   % 
+   % end
+   % 
+   %  % the conditions for dCdt(i) being zeroed are having a point
+   %  % concentration lower than 0 and it not increasing
+   %  % i.e. its time partial derivative is negative
+   % 
+   %  if (Concentration_array(i)) < 0 && dCdt_i<0
+   % 
+   % 
+   %      dCdt(i) = 0;
+   %  else
+   %      dCdt(i) = dCdt_i;
+   % 
+   % 
+   %  end
 
     %dCdt(i) =(v_avg .* y(i) + (v_star - v_avg)) ./ (v_avg .* t - H) .* dCdy(i) + (E_m(i)./ (v_avg .* t - H).^2) .* d2Cdy2(i) - alfa(i)./ (Temperature_array(1).*(v_avg .* t - H).^2) .* (dCdy(i).* (dTdy(i) - dTdy(1)) + Concentration_array(i).* d2Tdy2(i));
 end
@@ -672,6 +657,27 @@ function phi = flux_limiter(r, method)
         otherwise
             phi = 1;  % No limiter (upwind scheme)
     end
+end
+
+
+
+
+
+%% Funzione per calcolare v_avg durante i cicli
+function v_avg = v_cicli(t, V_serbatoio, diametro, t_riempimento, t_riposo, t_svuotamento, cycle_duration)
+v_riempimento = V_serbatoio / (pi * (diametro / 2)^2 * t_riempimento);
+v_svuotamento = -V_serbatoio / (pi * (diametro / 2)^2 * t_svuotamento);
+
+cycle_time = mod(t, cycle_duration);
+
+
+if cycle_time <= t_riempimento
+    v_avg = v_riempimento;
+elseif cycle_time <= (t_riempimento + t_riposo)
+    v_avg = 0;
+else
+    v_avg = v_svuotamento;
+end
 end
 
 
