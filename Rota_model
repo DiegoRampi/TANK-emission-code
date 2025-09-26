@@ -1,0 +1,425 @@
+%% ===========================  Compute_Rota_Flux.m  ===========================
+% Stand-alone 1D tank-breathing model (no condensation)
+% MUSCL/TVD spatial derivatives with selectable flux limiter (local function).
+%
+% ==============================================================================
+% PURPOSE
+%   Simulate vapour concentration C and gas temperature T in a large storage
+%   tank subject to slow "breathing" flows. Spatial derivatives use a MUSCL/TVD
+%   scheme with limiters to avoid spurious oscillations; time integration uses
+%   ode15s as an index-1 DAE with a singular mass matrix and sparse JPattern.
+%
+% SCOPE & ASSUMPTIONS (high level)
+%   • 1D vertical domain y ∈ [0,1] mapped to physical height z ∈ [0,H].
+%   • Gas at constant pressure P; ideal-gas density ρ(T) through P/(R T).
+%   • “Empty-tube” axial dispersion closures for heat (Et) and mass (Em).
+%   • Prescribed average breathing velocity v_avg(t), with a minimum magnitude
+%     threshold v_min (sign preserved).
+%   • Denominator protection: den = max(|v_avg t − H|, eps_denom) for transformed terms.
+%   • Mixed (averaged) boundary conditions at bottom and top for C and T.
+%   • AP-42 style ΔT proxy: Tilg = TL − Tt = Tv (comment reference).
+%   • **No condensation model:** C is not post-clamped to saturation here.
+%
+% INPUTS/OUTPUTS
+%   Inputs (Excel, hourly column vectors in the same folder):
+%     - TL.xlsx       bottom liquid temperature [K]
+%     - Tt.xlsx       roof/top gas temperature [K]
+%     - v_avg.xlsx    average breathing velocity [m s^-1]
+%     - livello.xlsx  liquid level [m]
+%
+%   Quick plots:
+%     - Hourly top vapour density [g m^-3]
+%     - Sample vertical profiles of C and T at a representative hour
+%
+% UNITS
+%   • Length: m   • Time: s   • Pressure: Pa   • Temperature: K
+%   • C: mol m^-3 (converted to g m^-3 for top-curve plotting only)
+%
+% NOTES
+%   - Select limiter via p.limiter ∈ {'minmod','vanleer','superbee','vanalbada'}.
+%   - Increase p.N or lower MaxStep for sharper profiles / stability as needed.
+%   - Compare with your condensation model to gauge sensitivity to clamping.
+% ==============================================================================
+
+clear, clc, close
+
+%% -----------------------------------------------------------------------------
+% 1) BASE PARAMETERS & CONSTANTS
+% -----------------------------------------------------------------------------
+p = struct();
+
+% Geometry & basic properties
+p.H    = 18;           % [m]   tank height
+p.Diam = 50;           % [m]   tank diameter
+p.P    = 1e5;          % [Pa]  gas pressure (assumed constant)
+p.M    = 0.13;         % [kg/mol] molar mass (diesel surrogate)
+p.R    = 8.314;        % [J/(mol·K)] ideal-gas constant
+
+% Gas phase (assumed weakly T-dependent → taken constant here)
+p.k_G  = 0.025;        % [W/(m·K)] thermal conductivity
+p.D    = 1e-5;         % [m^2/s]   molecular (binary) diffusivity
+p.cp_G = 1005;         % [J/(kg·K)] heat capacity (per mass)
+p.mu_G = 1.85e-5;      % [Pa·s]    dynamic viscosity
+
+% Liquid phase (for completeness / future coupling)
+p.cp_L   = 2200;       % [J/(kg·K)]
+p.rho_L  = 835;        % [kg/m^3]
+p.k_L    = 0.19;       % [W/(m·K)]
+p.nu_L   = 3e-6;       % [m^2/s]
+p.DeltaH = 360e3*p.M;  % [J/mol] latent heat (~360 kJ/kg over molar basis)
+
+% Antoine (diesel surrogate; correlation expects °C → handled via 1.8*T)
+p.A_ant = 12.101;  p.B_ant = 8907;  p.C_ant = 0;
+
+% Numerical thresholds & protections
+p.vmin      = 1.0e-8;  % [m/s] minimum |v_avg| (preserve sign)
+p.eps_denom = 1.0e-4;  % [m]   denominator floor for transformed operators
+
+% Limiter for TVD/MUSCL first derivatives
+p.limiter = 'superbee'; % {'minmod','vanleer','superbee','vanalbada'}
+
+% Time-varying inputs (hourly Excel → piecewise-linear in time)
+p.TL      = @(t) get_TL(t);       % [K] bottom liquid temperature
+p.Tt      = @(t) get_Tt(t);       % [K] top/roof temperature
+p.vav_raw = @(t) get_v_avg(t);    % [m/s] average breathing velocity
+p.livello = @(t) get_livello(t);  % [m] liquid level (affects gas volume)
+
+% Grid (uniform y ∈ [0,1] with internal nodes; ghosts handled inside ops)
+p.N  = 62;             % number of internal nodes (fine grid)
+p.dy = 1/p.N;
+
+%% -----------------------------------------------------------------------------
+% 2) INITIAL CONDITIONS (physically consistent profiles)
+% -----------------------------------------------------------------------------
+TL0  = p.TL(0);
+Tt0  = p.Tt(0);
+yvec = linspace(0,1,p.N)';
+
+% Linear sensible temperature profile; initial C at local saturation
+T0 = TL0 + (Tt0 - TL0).*yvec;
+Csat_fun = @(T) 6894.76 .* exp(p.A_ant - p.B_ant./(1.8*T)) ./ (p.R*T);
+C0 = Csat_fun(T0);
+
+% State vector (internal nodes only): y = [C; T]
+y0 = [C0 ; T0];
+
+%% -----------------------------------------------------------------------------
+% 3) MASS MATRIX (index-1 DAE)
+% -----------------------------------------------------------------------------
+% Interior equations are differential; boundary nodes enforced algebraically.
+N    = p.N;
+Mmat = eye(2*N);
+Mmat([1 N N+1 2*N],[1 N N+1 2*N]) = 0;  % boundary rows → algebraic constraints
+
+%% -----------------------------------------------------------------------------
+% 4) TIME INTEGRATION (ode15s, sparse Jacobian pattern)
+% -----------------------------------------------------------------------------
+tEnd = 8760*3600;  % [s] one full year
+
+% Tridiagonal sparsity fits the local stencils used in the RHS
+band = ones(2*N,1);
+Jpat = spdiags([band band band], -1:1, 2*N, 2*N) ~= 0;
+
+odeOpts = odeset('RelTol',1e-5, 'AbsTol',1e-4, ...
+                 'Mass',Mmat, 'MassSingular','yes', ...
+                 'MaxStep',3600, ...       % cap at 1 h steps
+                 'JPattern',Jpat);
+
+[t,y] = ode15s(@(tt,yy) rhs_main(tt,yy,p), [0 tEnd], y0, odeOpts);
+
+%% -----------------------------------------------------------------------------
+% 5) RECONSTRUCT FULL SOLUTION (N+2 columns incl. ghosts) + Em/Et fields
+% -----------------------------------------------------------------------------
+% Rebuild arrays with ghost columns at ends (for post-processing/diagnostics)
+[Cfull,Tfull] = rebuildSolution(t, y, p);
+
+% Discard outermost two ghosts on each side → keep well-resolved interior band
+idxKeep = 3:size(Cfull,2)-2;
+Cfull   = Cfull(:, idxKeep);
+Tfull   = Tfull(:, idxKeep);
+Ntot    = numel(idxKeep);
+
+% Build time-varying Em/Et fields (diagnostic): use local T and current v_avg
+nt       = numel(t);
+Em_full  = zeros(nt, Ntot);
+Et_full  = zeros(nt, Ntot);
+for k = 1:nt
+    vavg_k = max(abs(p.vav_raw(t(k))), p.vmin) .* sign(p.vav_raw(t(k)));
+    [Em_k, Et_k] = axialDispersion(Tfull(k,:).', vavg_k, p);
+    Em_full(k,:) = Em_k.';
+    Et_full(k,:) = Et_k.';
+end
+
+%% -----------------------------------------------------------------------------
+% 6) HOURLY AVERAGES (uniform time grid)
+% -----------------------------------------------------------------------------
+time_h = (0:8760)';  % [h] 0…8760
+C_hour  = interp1(t/3600, Cfull,   time_h, 'linear', 'extrap');
+T_hour  = interp1(t/3600, Tfull,   time_h, 'linear', 'extrap');
+Em_hour = interp1(t/3600, Em_full, time_h, 'linear', 'extrap');
+Et_hour = interp1(t/3600, Et_full, time_h, 'linear', 'extrap');
+
+%% -----------------------------------------------------------------------------
+% 7) QUICK PLOTS (top vapour density + sample vertical profiles)
+% -----------------------------------------------------------------------------
+% Convert top-node concentration to g m^-3 (non-negative)
+C_g_m3_top = max(C_hour(:,end) * p.M * 1e3, 0);
+
+figure, plot(time_h, C_g_m3_top, 'LineWidth', 0.7)
+xlabel('Time [h]'), ylabel('Concentration [g m^{-3}]'), grid on
+title('Hourly vapor density at tank top')
+
+% Representative hour for vertical profiles (guard against bounds)
+ora_sel = min(5859, numel(time_h)-1);
+y_nodes = linspace(0,1,Ntot);
+
+figure
+subplot(1,2,1), plot(y_nodes, C_hour(ora_sel+1,:)), grid on
+xlabel('y'), ylabel('C [mol m^{-3}]'), title(sprintf('C profile (hour %d)', ora_sel))
+subplot(1,2,2), plot(y_nodes, T_hour(ora_sel+1,:)), grid on
+xlabel('y'), ylabel('T [K]'),           title(sprintf('T profile (hour %d)', ora_sel))
+sgtitle(sprintf('Vertical profiles – hour %d', ora_sel))
+
+%% ============================================================================
+%                                LOCAL FUNCTIONS
+% ============================================================================
+
+function dudt = rhs_main(t, y, p)
+% DAE residual for ode15s (index-1):
+%   M*y' = F(t,y), with algebraic constraints at boundaries and ODEs inside.
+%
+% STATE LAYOUT
+%   y(1:N)     = C (vapour concentration) at internal nodes
+%   y(N+1:2N)  = T (gas temperature)     at internal nodes
+
+    % Unpack
+    N  = p.N;  dy = p.dy;
+    C  = y(1:N);
+    T  = y(N+1:2*N);
+
+    %% --- Time-dependent boundary data
+    TL   = p.TL(t);                                         % [K]
+    Csat = 6894.76*exp(p.A_ant - p.B_ant/(1.8*TL))/(p.R*TL);% sat conc at bottom
+    Ttop = p.Tt(t);                                         % [K]
+    Ctop = C(max(N-1,1));                                   % near-top interior ref
+
+    % Mixed (averaged) BCs to damp boundary oscillations
+    C(1) = 0.5*(Csat + C(1));   % bottom species (towards saturation)
+    T(1) = 0.5*(TL   + T(1));   % bottom temperature
+
+    % Breathing velocity with magnitude floor
+    v_raw = p.vav_raw(t);
+    vavg  = max(abs(v_raw), p.vmin) .* sign(v_raw);
+
+    % Top species boundary:
+    %   outflow (v_raw >= 0): weak mix with interior
+    %   inflow  (v_raw  < 0): dilute using 1-hour inflow vs tank gas volume
+    if v_raw >= 0
+        C(N) = 0.5*(Ctop + C(N));
+    else
+        lvl   = p.livello(t);
+        Area  = pi*(p.Diam/2)^2;
+        Vol   = Area*(p.H - lvl);            % gas volume [m^3]
+        Qin   = abs(vavg)*Area*3600;         % inflow volume over 1 h [m^3]
+        C(N)  = 0.5*( (Ctop*Vol)/(Vol+Qin) + C(N)*Vol/(Vol+Qin) );
+    end
+    T(N) = 0.5*(Ttop + T(N));                % top temperature (mixed)
+
+    %% --- Spatial derivatives (MUSCL/TVD first; centered second)
+    [dC,dT,d2C,d2T] = limitedDerivatives(C, T, dy, p);
+
+    %% --- Transport coefficients (empty-tube style closures)
+    rho0  = p.P/(p.R*TL);
+    vstar = vavg - p.D/rho0 * dC(1);         % Fickian correction at bottom
+
+    Et = zeros(N,1);  Em = zeros(N,1);
+    for i = 1:N
+        Ti  = T(i);
+        rho = p.P/(p.R*Ti);
+        Re  = abs(vavg*p.Diam*rho/p.mu_G);
+        Pr  = p.mu_G*p.cp_G/p.k_G;
+        Sc  = p.mu_G/(rho*p.M*p.D);
+        % Composite Péclet forms: capture molecular and dispersive limits
+        Pe_t = 1/(Re*Pr) + (Re*Pr)/192;
+        Pe_m = 1/(Re*Sc) + (Re*Sc)/192;
+        Et(i) = Pe_t * p.k_G/(rho*p.cp_G);   % [m^2/s]
+        Em(i) = Pe_m * p.D;                  % [m^2/s]
+    end
+
+    %% --- Semi-discrete equations on interior nodes
+    den = max(abs(vavg*t - p.H), p.eps_denom);
+
+    dCdt = zeros(N,1);
+    dTdt = zeros(N,1);
+    for i = 2:N-1
+        A1 = (vavg*((i-1)*dy) + (vstar - vavg)) / den; % effective advection coeff
+        A2 = Em(i) / den^2;                            % effective diffusion coeff
+
+        % Species:
+        % ∂C/∂t = A1 * ∂C/∂y + A2 * ∂²C/∂y²
+        %        − (Et/(TL*den^2)) * [ (∂C/∂y)(∂T/∂y − ∂T/∂y|bottom) + C * ∂²T/∂y² ]
+        dCdt(i) = A1*dC(i) + A2*d2C(i) ...
+                 - Et(i)/(TL*den^2) * ( dC(i)*(dT(i)-dT(1)) + C(i)*d2T(i) );
+
+        % Energy:
+        % ∂T/∂t = A1 * ∂T/∂y
+        %        + (Et/(TL*den^2)) * [ T*∂²T/∂y² − (∂T/∂y)^2 + (∂T/∂y|bottom)*∂T/∂y ]
+        dTdt(i) = A1*dT(i) ...
+                 + Et(i)/(TL*den^2) * ( T(i)*d2T(i) - dT(i)^2 + dT(1)*dT(i) );
+    end
+
+    %% --- Assemble DAE residuals (algebraic at boundaries, ODE inside)
+    dudt = zeros(2*N,1);
+    % Species constraints and interior ODEs
+    dudt(1)       = C(1) - Csat;          % bottom algebraic: C = Csat(TL)
+    dudt(2:N-1)   = dCdt(2:N-1);          % interior ODEs
+    dudt(N)       = Ctop - C(N);          % top algebraic: weak mix target
+    % Energy constraints and interior ODEs
+    dudt(N+1)       = TL - T(1);          % bottom algebraic: T = TL
+    dudt(N+2:2*N-1) = dTdt(2:N-1);        % interior ODEs
+    dudt(2*N)       = Ttop - T(N);        % top algebraic: T = Ttop
+end
+
+function [dC,dT,d2C,d2T] = limitedDerivatives(C, T, dy, p)
+% Helper wrapper: MUSCL/TVD first derivatives + centered second derivatives
+    [dC, d2C] = fluxLimitedDerivatives(C, dy, p.limiter);
+    [dT, d2T] = fluxLimitedDerivatives(T, dy, p.limiter);
+end
+
+function [Cfull, Tfull] = rebuildSolution(tvec, ySol, p)
+% Reconstruct arrays including ghost nodes to ease post-processing/diagnostics.
+% Ghosts: bottom uses saturation (for C) and TL; top uses last interior for C and Tt.
+    Nin  = p.N;
+    Ntot = Nin + 2;
+    nt   = numel(tvec);
+    Cfull = zeros(nt, Ntot);
+    Tfull = zeros(nt, Ntot);
+    for k = 1:nt
+        TLk  = p.TL(tvec(k));
+        Ttk  = p.Tt(tvec(k));
+        Csat = 6894.76*exp(p.A_ant - p.B_ant/(1.8*TLk))/(p.R*TLk);
+        Ci = ySol(k, 1:Nin);
+        Ti = ySol(k, Nin+1:2*Nin);
+        Cfull(k,:) = [ Csat, Ci, Ci(end) ];
+        Tfull(k,:) = [ TLk , Ti, Ttk     ];
+    end
+end
+
+function [Em, Et] = axialDispersion(T, vavg, p)
+% Compute local Em (mass) and Et (thermal) effective axial diffusivities
+% based on composite Péclet relations ("empty-tube" style).
+    N  = numel(T);
+    Em = zeros(N,1);
+    Et = zeros(N,1);
+    for i = 1:N
+        Ti  = T(i);
+        rho = p.P/(p.R*Ti);
+        Re  = abs(vavg*p.Diam*rho/p.mu_G);
+        Pr  = p.mu_G*p.cp_G/p.k_G;
+        Sc  = p.mu_G/(rho*p.M*p.D);
+        Pe_t = 1/(Re*Pr) + (Re*Pr)/192;
+        Pe_m = 1/(Re*Sc) + (Re*Sc)/192;
+        Et(i) = Pe_t * p.k_G/(rho*p.cp_G);
+        Em(i) = Pe_m * p.D;
+    end
+end
+
+%% --------------------- External data (Excel look-ups) ---------------------
+% Each helper lazily reads the Excel column once, then interpolates in time
+% (hours → seconds) via linear interpolation with extrapolation at ends.
+
+function TL = get_TL(t)
+    persistent data tvec
+    if isempty(data)
+        data = readmatrix('TL.xlsx');  tvec = (0:numel(data)-1)';  % hours
+    end
+    TL = interp1(tvec, data, t/3600, 'linear', 'extrap');          % seconds→hours
+end
+
+function Tt = get_Tt(t)
+    persistent data tvec
+    if isempty(data)
+        data = readmatrix('Tt.xlsx');  tvec = (0:numel(data)-1)';  % hours
+    end
+    Tt = interp1(tvec, data, t/3600, 'linear', 'extrap');
+end
+
+function v = get_v_avg(t)
+    persistent data tvec
+    if isempty(data)
+        data = readmatrix('v_avg.xlsx');  tvec = (0:numel(data)-1)'; % hours
+    end
+    v = interp1(tvec, data, t/3600, 'linear', 'extrap');
+end
+
+function lvl = get_livello(t)
+    persistent data tvec
+    if isempty(data)
+        data = readmatrix('livello.xlsx');  tvec = (0:numel(data)-1)'; % hours
+    end
+    lvl = interp1(tvec, data, t/3600, 'linear', 'extrap');
+end
+
+%% ===============  TVD / MUSCL DERIVATIVES (LOCAL OPERATOR)  ===============
+function [dfdy, d2fdy2] = fluxLimitedDerivatives(f, dy, lim)
+%FLUXLIMITEDDERIVATIVES  MUSCL/TVD first derivative + centered second derivative.
+%   Inputs:
+%     f   : N×1 field at internal nodes
+%     dy  : grid spacing (uniform)
+%     lim : limiter string in {'minmod','vanleer','superbee','vanalbada'}
+%   Outputs:
+%     dfdy   : first derivative at nodes (via flux differences at faces)
+%     d2fdy2 : second derivative at nodes (centered 2nd order)
+    N = numel(f);
+    if N < 3, error('Need ≥ 3 grid points'); end
+    f   = f(:);
+    EPS = 1e-12;
+
+    % Ghost cells (linear extrapolation) → [gL, f(1..N), gR]
+    fext = [2*f(1)-f(2); f; 2*f(end)-f(end-1)];
+
+    % r-ratios and limiter φ at faces (N+1 faces for N cells)
+    phi = ones(N+1,1);
+    for i = 2:N
+        r = (fext(i) - fext(i-1)) / ( (fext(i+1) - fext(i)) + EPS );
+        phi(i) = applyLimiter(r, lim);
+    end
+
+    % MUSCL face states
+    fL = zeros(N+1,1);  fR = zeros(N+1,1);
+    for i = 2:N
+        fL(i) = fext(i)   + 0.5*phi(i)  *(fext(i)   - fext(i-1));
+        fR(i) = fext(i+1) - 0.5*phi(i+1)*(fext(i+2) - fext(i+1));
+    end
+    % End faces from ghosts
+    fL(1)     = fext(1);     fR(1)     = fext(2);
+    fL(N+1)   = fext(N+1);   fR(N+1)   = fext(N+2);
+
+    % Face flux and nodal first derivative
+    faceFlux = (fR - fL) / dy;
+    dfdy     = faceFlux(2:end) - faceFlux(1:end-1);
+
+    % Second derivative: classic centered 2nd order (robust)
+    d2fdy2   = zeros(N,1);
+    for i = 2:N-1
+        d2fdy2(i) = (f(i+1) - 2*f(i) + f(i-1)) / dy^2;
+    end
+    d2fdy2(1) = (f(3) - 2*f(2) + f(1)) / dy^2;
+    d2fdy2(N) = (f(N) - 2*f(N-1) + f(N-2)) / dy^2;
+end
+
+function phi = applyLimiter(r, lim)
+% Flux-limiter φ(r) for MUSCL reconstructions.
+    switch lower(lim)
+        case {'minmod','mm'}
+            phi = max(0, min(1, r));
+        case {'vanleer','vl'}
+            phi = (r + abs(r)) / (1 + abs(r) + eps);
+        case {'superbee','sb'}
+            phi = max(0, max(min(2*r,1), min(r,2)));
+        case {'vanalbada','va'}
+            phi = (r^2 + r) / (r^2 + 1 + eps);
+        otherwise
+            error('Unknown limiter "%s"', lim);
+    end
+end
