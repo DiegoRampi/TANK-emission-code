@@ -1,4 +1,4 @@
-%% ===========================  Compute_Rota_Flux.m  ===========================
+%% ===========================  Compute_Rota_Model.m  ===========================
 % Stand-alone 1D tank-breathing model (no condensation)
 % MUSCL/TVD spatial derivatives with selectable flux limiter (local function).
 %
