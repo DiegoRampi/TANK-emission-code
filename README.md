@@ -5,7 +5,7 @@ MATLAB models for 1D vertical tank-breathing with MUSCL/TVD spatial derivatives 
 ## Files
 
 - **`Compute_Condensation_Model.m`** — main model **with condensation clamp** (`C ≤ C_sat(T)` after integration).
-- **`Compute_NoCondensation_Model.m`** (aka `Compute_Rota_Model.m`) — variant **without condensation clamp** (diagnostics for `Em/Et` included).
+- **`Compute_Rota_Model.m`**  — variant **without condensation clamp** (diagnostics for `Em/Et` included).
 - **`TL.xlsx`** — bottom liquid temperature `[K]`, hourly column *(provide your data)*.
 - **`Tt.xlsx`** — roof/top gas temperature `[K]`, hourly column *(provide your data)*.
 - **`v_avg.xlsx`** — average breathing velocity `[m/s]`, hourly column *(provide your data)*.
@@ -32,5 +32,5 @@ MATLAB models for 1D vertical tank-breathing with MUSCL/TVD spatial derivatives 
    % With condensation clamp:
    Compute_Condensation_Model
    % Without condensation clamp:
-   Compute_NoCondensation_Model
+   Compute_Rota_Model
 
